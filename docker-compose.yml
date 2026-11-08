@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: donorflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: donorflow
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d donorflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: donorflow-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/donorflow
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-donorflow-development-secret-key-change-me-123456789}
+      COORDINATOR_USERNAME: ${COORDINATOR_USERNAME:-coordinator}
+      COORDINATOR_PASSWORD: ${COORDINATOR_PASSWORD:-coordinator123}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: donorflow-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  postgres_data:

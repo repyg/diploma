@@ -1,5 +1,5 @@
 import type { ApiError, DonorPage, DobroRequest, DobroResponse, IntervalCalendar, MemoRequest, OCRTask } from './types'
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 let token = localStorage.getItem('donorflow_token')
 export function setToken(value: string | null) { token = value; value ? localStorage.setItem('donorflow_token', value) : localStorage.removeItem('donorflow_token') }
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
