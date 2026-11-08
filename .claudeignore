@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+package-lock.json
+poetry.lock
+yarn.lock
+.git/
+*.pdf
+*.docx
+*.png
+*.jpg
+*.jpeg
+alembic/versions/

@@ -1,0 +1,10 @@
+export type Donor = { id: string; full_name: string; gender: string; academic_group: string | null; blood_group: string | null; rh_factor: string | null; kell_status: string | null; status: string; created_at: string }
+export type DonorPage = { items: Donor[]; total: number; limit: number; offset: number }
+export type DonationInterval = { previous_donation_date: string | null; previous_donation_type: string | null; next_donation_type: string; interval_days: number; eligible_from: string; whole_blood_donations_this_year: number; annual_whole_blood_limit: number; annual_limit_reached: boolean }
+export type Progress = { award_name: string; qualifying_donations: number; target_donations: number; progress_percent: number; achieved: boolean }
+export type IntervalCalendar = { donor: Donor; intervals: DonationInterval[]; honorary_progress: { moscow: Progress; russia: Progress } }
+export type OCRTask = { task_id: string; status: string; result: Record<string, unknown> | null; error: string | null }
+export type DobroRequest = { event_name: string; description?: string; start_time: string; end_time: string; volunteer_roles: string[] }
+export type DobroResponse = DobroRequest & { description: string; duration_hours: number; generated_locally: boolean }
+export type MemoRequest = { start_date: string; end_date: string; event_name: string; recipient_name: string; coordinator_ids: string[] }
+export type ApiError = Error & { status?: number }
