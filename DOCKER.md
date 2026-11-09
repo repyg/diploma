@@ -31,7 +31,14 @@ docker compose up --build
 Пароль: coordinator123
 ```
 
-Контейнер backend при старте автоматически выполняет `seed.py`. Скрипт идемпотентен и не удаляет существующие записи.
+Контейнер backend при старте автоматически создаёт только структуру пустой PostgreSQL-базы. Демонстрационные доноры и справки не загружаются.
+
+Для проекта используется отдельный новый Docker volume `diploma_donor_postgres_data_clean`, поэтому старые данные из volume `postgres_data` не попадут в новый запуск. Записи, добавленные после запуска, сохраняются при перезапуске контейнеров. Чтобы полностью очистить текущую базу и начать заново, выполните:
+
+```powershell
+docker compose down -v
+docker compose up --build
+```
 
 ## Запуск в фоне
 
@@ -86,7 +93,7 @@ COORDINATOR_PASSWORD=сложный-пароль
 
 ## Архитектура
 
-- `db`: PostgreSQL 16, данные в volume `postgres_data`.
+- `db`: PostgreSQL 16, данные в отдельном volume `diploma_donor_postgres_data_clean`.
 - `backend`: FastAPI на порту 8000 внутри и снаружи Docker.
 - `frontend`: production-сборка React/Vite в Nginx на порту 5173.
 - Nginx проксирует `/api/*` и `/health` в контейнер `backend`, поэтому браузер использует единый origin `http://localhost:5173`.

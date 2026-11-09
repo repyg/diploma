@@ -3,9 +3,29 @@
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .models import DonationType, DonorGender, DonorStatus
+
+
+def normalize_donation_type(value):
+    if isinstance(value, DonationType):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        aliases = {
+            "цельная кровь": DonationType.WHOLE_BLOOD,
+            "кровь": DonationType.WHOLE_BLOOD,
+            "whole_blood": DonationType.WHOLE_BLOOD,
+            "плазма": DonationType.PLASMA,
+            "плазмаферез": DonationType.PLASMA,
+            "plasma": DonationType.PLASMA,
+            "тромбоциты": DonationType.PLATELETS,
+            "тромбоцитаферез": DonationType.PLATELETS,
+            "platelets": DonationType.PLATELETS,
+        }
+        return aliases.get(normalized, value)
+    return value
 
 
 class ORMModel(BaseModel):
@@ -16,23 +36,43 @@ class DonationCreate(BaseModel):
     donation_date: date
     donation_type: DonationType
 
+    @field_validator("donation_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value):
+        return normalize_donation_type(value)
+
 
 class DonationRead(ORMModel):
     id: UUID
     donor_id: UUID
+    donor_full_name: str | None = None
+    academic_group: str | None = None
+    donor_status: DonorStatus | None = None
     donation_date: date
     donation_type: DonationType
     is_rewarded: bool
+    medical_center: str | None = None
+    certificate_number: str | None = None
     created_at: datetime
 
 
 class DonorCreate(BaseModel):
     full_name: str = Field(min_length=2, max_length=255)
-    gender: DonorGender
+    gender: DonorGender = DonorGender.MALE
     academic_group: str | None = Field(default=None, max_length=32)
     blood_group: str | None = Field(default=None, max_length=8)
     rh_factor: str | None = Field(default=None, max_length=4)
     kell_status: str | None = Field(default=None, max_length=16)
+
+    @field_validator("gender", mode="before")
+    @classmethod
+    def blank_gender_defaults_to_male(cls, value):
+        return DonorGender.MALE if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("academic_group", "blood_group", "rh_factor", "kell_status", mode="before")
+    @classmethod
+    def empty_strings_to_none(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 class DonorUpdate(BaseModel):
@@ -43,6 +83,11 @@ class DonorUpdate(BaseModel):
     rh_factor: str | None = Field(default=None, max_length=4)
     kell_status: str | None = Field(default=None, max_length=16)
     status: DonorStatus | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def empty_strings_to_none(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 class DonorRead(ORMModel):
@@ -55,6 +100,7 @@ class DonorRead(ORMModel):
     kell_status: str | None
     status: DonorStatus
     created_at: datetime
+    donations: list[DonationRead] = Field(default_factory=list)
 
 
 class DonationIntervalResult(BaseModel):
@@ -131,6 +177,27 @@ class DonationVerify(BaseModel):
     donor_id: UUID
     donation_date: date
     donation_type: DonationType
+    medical_center: str | None = None
+    certificate_number: str | None = None
+
+    @field_validator("donation_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value):
+        return normalize_donation_type(value)
+
+
+class DonationListRead(ORMModel):
+    id: UUID
+    donor_id: UUID
+    donor_full_name: str
+    academic_group: str | None
+    donor_status: DonorStatus
+    donation_date: date
+    donation_type: DonationType
+    is_rewarded: bool
+    medical_center: str | None = None
+    certificate_number: str | None = None
+    created_at: datetime
 
 
 class OCRTaskResponse(BaseModel):
@@ -152,6 +219,11 @@ class KPPRequest(BaseModel):
     donation_type: DonationType = DonationType.WHOLE_BLOOD
     on_date: date
     donor_ids: list[UUID] | None = None
+
+    @field_validator("donation_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value):
+        return normalize_donation_type(value)
 
 
 class KPPEntry(BaseModel):

@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data_clean:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d donorflow"]
       interval: 5s
@@ -26,6 +26,7 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-donorflow-development-secret-key-change-me-123456789}
       COORDINATOR_USERNAME: ${COORDINATOR_USERNAME:-coordinator}
       COORDINATOR_PASSWORD: ${COORDINATOR_PASSWORD:-coordinator123}
+      OCR_USE_MOCK: ${OCR_USE_MOCK:-false}
     depends_on:
       db:
         condition: service_healthy
@@ -44,4 +45,5 @@ services:
       - "5173:80"
 
 volumes:
-  postgres_data:
+  postgres_data_clean:
+    name: diploma_donor_postgres_data_clean

@@ -1,6 +1,9 @@
 """Certificate upload and in-process OCR task endpoints."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from difflib import SequenceMatcher
+import re
 from threading import Lock
 from time import monotonic
 from uuid import UUID, uuid4
@@ -31,24 +34,100 @@ def _prune() -> None:
             _TASKS.pop(task_id, None)
 
 
+def _normalize_name(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().casefold().replace("ё", "е"))
+
+
+def _stem_word(word: str) -> str:
+    """Убираем только падежные окончания у длинных слов (не трогая корни)."""
+    if len(word) <= 5:
+        return word
+    return re.sub(r"(?:овой|евой|иной|скому|цкому|ому|ему|ой|ей|ом|ем|у|ю|е)$", "", word)
+
+
+def _name_similarity(ocr_name: str, db_name: str) -> float:
+    words_ocr = _normalize_name(ocr_name).split()
+    words_db = _normalize_name(db_name).split()
+    if len(words_ocr) < 2 or len(words_db) < 2:
+        return 0.0
+
+    # В русских справках порядок всегда «Фамилия Имя [Отчество]».
+    # Проверяем, чтобы фамилия и имя совпадали по отдельности, а не только отчество!
+    stems_ocr = [_stem_word(w) for w in words_ocr]
+    stems_db = [_stem_word(w) for w in words_db]
+
+    # Сравниваем первое слово (Фамилию) с первым или последним словом в БД
+    surname_score = max(
+        SequenceMatcher(None, stems_ocr[0], stems_db[0]).ratio(),
+        SequenceMatcher(None, stems_ocr[0], stems_db[-1]).ratio(),
+    )
+    if surname_score < 0.82:
+        # Если фамилия вообще не похожа — это точно другой человек!
+        return 0.0
+
+    full_ocr = " ".join( sorted(stems_ocr) )
+    full_db = " ".join( sorted(stems_db) )
+    return SequenceMatcher(None, full_ocr, full_db).ratio()
+
+
+def _find_donor(db: Session, extracted: dict, raw_text: str = "") -> Donor | None:
+    donor_id = extracted.get("student_id")
+    if donor_id:
+        try:
+            donor = db.get(Donor, UUID(str(donor_id)))
+        except (ValueError, TypeError):
+            donor = None
+        if donor is not None:
+            return donor
+
+    name = extracted.get("full_name")
+    if not name:
+        return None
+
+    all_donors = list(db.scalars(select(Donor)).all())
+    if not all_donors:
+        return None
+
+    scored = [(_name_similarity(name, d.full_name), d) for d in all_donors]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored and scored[0][0] >= 0.85:
+        return scored[0][1]
+
+    return None
+
+
 def _process(task_id: UUID, content: bytes) -> None:
     try:
         result = parse_certificate(content)
+        raw_text = result.get("raw_text", "")
         extracted = result.get("extracted_data") or {}
-        donor_id = extracted.get("student_id")
         donation_date = extracted.get("donation_date")
         duplicate = False
-        if donor_id and donation_date:
-            try:
-                donor_uuid = UUID(str(donor_id))
-                from datetime import date
-                parsed_date = date.fromisoformat(str(donation_date))
-                with SessionLocal() as db:
-                    donor = db.get(Donor, donor_uuid)
-                    if donor:
-                        duplicate = db.scalar(select(Donation.id).where(Donation.donor_id == donor_uuid, Donation.donation_date == parsed_date)) is not None
-            except (ValueError, TypeError):
-                pass
+
+        with SessionLocal() as db:
+            donor = _find_donor(db, extracted, raw_text)
+            if donor is not None:
+                # Автоматическое обогащение данными из БД контингента
+                extracted["student_id"] = str(donor.id)
+                extracted["full_name"] = donor.full_name
+                if not extracted.get("academic_group"):
+                    extracted["academic_group"] = donor.academic_group
+                extracted["donation_sequence_number"] = len(donor.donations) + 1
+
+                if donation_date:
+                    try:
+                        parsed_date = date.fromisoformat(str(donation_date))
+                    except (ValueError, TypeError):
+                        parsed_date = None
+                    if parsed_date is not None:
+                        duplicate = db.scalar(
+                            select(Donation.id).where(
+                                Donation.donor_id == donor.id,
+                                Donation.donation_date == parsed_date,
+                            )
+                        ) is not None
+
+        result["extracted_data"] = extracted
         result["is_duplicate"] = duplicate
         with _TASK_LOCK:
             if task_id in _TASKS:

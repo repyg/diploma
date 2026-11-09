@@ -1,14 +1,21 @@
 """Donor registry and eligibility endpoints."""
 
-from datetime import date
+from datetime import date, datetime, timedelta
+from io import BytesIO, StringIO
+import csv
+import json
+import re
+import zipfile
 from uuid import UUID
+from xml.etree import ElementTree as ET
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from ..database import get_db
-from ..models import DonationType, Donor, DonorStatus
+from ..models import Donation, DonationType, Donor, DonorGender, DonorStatus
 from ..schemas import (CoursePromotionBatchResult, CoursePromotionRequest, CoursePromotionResult, DonorCreate, DonorPage, DonorRead, DonorUpdate, DonationIntervalResult, HonoraryDonorProgress, HonoraryDonorProgressResult, IntervalCalendar)
 from ..services.calculator import (annual_whole_blood_limit, calculate_next_eligible_date, count_whole_blood_donations, honorary_donor_progress, promote_donors_for_september, required_interval_days)
 from .auth import get_current_user
@@ -16,10 +23,226 @@ from .auth import get_current_user
 router = APIRouter(prefix="/donors", tags=["donors"])
 
 
+def _dedupe_key(full_name: str, academic_group: str | None) -> tuple[str, str]:
+    normalize = lambda value: re.sub(r"\s+", " ", value.strip()).casefold()
+    return normalize(full_name), normalize(academic_group or "")
+
+
+def _infer_gender(full_name: str) -> str | None:
+    parts = full_name.strip().casefold().split()
+    patronymic = parts[1] if len(parts) > 1 else ""
+    surname = parts[0] if parts else ""
+    if re.search(r"(ич|оглы|улы)$", patronymic) or re.search(r"(ов|ев|ин|ын|ский|цкий)$", surname):
+        return "male"
+    if re.search(r"(на|кызы)$", patronymic) or re.search(r"(ова|ева|ина|ына|ская|цкая)$", surname):
+        return "female"
+    return None
+
+
+def _xlsx_rows(content: bytes) -> list[list[str]]:
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            for item in root.findall("x:si", ns):
+                shared.append("".join(node.text or "" for node in item.iter() if node.tag.endswith("}t")))
+        sheet_name = "xl/worksheets/sheet1.xml"
+        if sheet_name not in archive.namelist():
+            raise ValueError("XLSX не содержит первый лист")
+        root = ET.fromstring(archive.read(sheet_name))
+        ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        rows: list[list[str]] = []
+        for row in root.findall(".//x:sheetData/x:row", ns):
+            values: dict[int, str] = {}
+            for cell in row.findall("x:c", ns):
+                ref = cell.attrib.get("r", "A1")
+                column = 0
+                for char in re.match(r"[A-Z]+", ref).group(0):
+                    column = column * 26 + ord(char) - 64
+                column -= 1
+                value = cell.find("x:v", ns)
+                text = value.text if value is not None and value.text else ""
+                if cell.attrib.get("t") == "s" and text.isdigit():
+                    text = shared[int(text)] if int(text) < len(shared) else ""
+                values[column] = text
+            if values:
+                rows.append([values.get(i, "") for i in range(max(values) + 1)])
+        return rows
+
+
+def _table_payload(filename: str, content: bytes) -> list[dict[str, str]]:
+    suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if suffix == "xlsx":
+        rows = _xlsx_rows(content)
+    else:
+        delimiter = "\t" if suffix == "tsv" else None
+        text = content.decode("utf-8-sig")
+        try:
+            detected = delimiter or csv.Sniffer().sniff(text[:4096]).delimiter
+        except csv.Error:
+            detected = ","
+        rows = list(csv.reader(StringIO(text), delimiter=detected))
+    if not rows:
+        return []
+    headers = [str(value).strip() for value in rows[0]]
+    return [dict(zip(headers, row)) for row in rows[1:] if any(str(value).strip() for value in row)]
+
+
+@router.post("/parse-import")
+async def parse_import(request: Request, _: str = Depends(get_current_user)) -> dict:
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "filename"):
+        raise HTTPException(status_code=422, detail="Передайте файл в поле file")
+    filename = str(upload.filename or "")
+    if filename.lower().rsplit(".", 1)[-1] not in {"csv", "tsv", "xlsx"}:
+        raise HTTPException(status_code=415, detail="Поддерживаются CSV, TSV и XLSX")
+    try:
+        rows = _table_payload(filename, await upload.read())
+    except (UnicodeDecodeError, zipfile.BadZipFile, ET.ParseError, csv.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Не удалось прочитать файл импорта") from exc
+    headers = list(rows[0].keys()) if rows else []
+    return {"headers": headers, "rows": rows, "total": len(rows)}
+
+
+def _row_value(row: dict[str, str], *names: str) -> str | None:
+    normalized = {re.sub(r"[^a-zа-яё0-9]", "", key.casefold()): value for key, value in row.items()}
+    for name in names:
+        value = normalized.get(re.sub(r"[^a-zа-яё0-9]", "", name.casefold()))
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _parse_import_date(value: object) -> date | None:
+    if value is None or not str(value).strip():
+        return None
+    text = str(value).strip()
+    try:
+        serial = float(text.replace(",", "."))
+    except ValueError:
+        serial = None
+    if serial is not None and 25000 <= serial <= 65000:
+        return date(1899, 12, 30) + timedelta(days=int(serial))
+    for pattern in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _import_donation_type(value: str | None) -> DonationType | None:
+    if not value:
+        return None
+    normalized = re.sub(r"[^a-zа-яё0-9]", "", value.casefold())
+    if any(term in normalized for term in ("плазм", "plasma")):
+        return DonationType.PLASMA
+    if any(term in normalized for term in ("тромбоц", "platelet")):
+        return DonationType.PLATELETS
+    if any(term in normalized for term in ("цельнаякровь", "кровь", "wholeblood", "донорствокрови")):
+        return DonationType.WHOLE_BLOOD
+    return None
+
+
+def _import_rewarded(value: str | None) -> bool:
+    return bool(value and value.strip().casefold() in {"1", "true", "yes", "да", "поощрена", "поощрено"})
+
+
+@router.post("/bulk-import")
+async def bulk_import(request: Request, db: Session = Depends(get_db), _: str = Depends(get_current_user)) -> dict:
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        raw = json.loads((await request.body()).decode("utf-8"))
+        if not isinstance(raw, list):
+            raise HTTPException(status_code=422, detail="Ожидается массив доноров")
+        rows = [item if isinstance(item, dict) else {} for item in raw]
+    else:
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "filename"):
+            raise HTTPException(status_code=422, detail="Передайте файл в поле file")
+        filename = str(upload.filename or "")
+        if filename.lower().rsplit(".", 1)[-1] not in {"csv", "tsv", "xlsx"}:
+            raise HTTPException(status_code=415, detail="Поддерживаются CSV, TSV и XLSX")
+        rows = _table_payload(filename, await upload.read())
+
+    existing = list(db.scalars(select(Donor).options(selectinload(Donor.donations))))
+    by_key = {_dedupe_key(d.full_name, d.academic_group): d for d in existing}
+    result = {"created": 0, "updated": 0, "skipped": 0, "donations_created": 0, "donations_skipped": 0, "items": []}
+    for index, row in enumerate(rows, start=2):
+        try:
+            full_name = _row_value(row, "full_name", "фио", "студент", "донор", "name") or ""
+            gender_value = _row_value(row, "gender", "пол", "sex")
+            gender = (gender_value or _infer_gender(full_name) or DonorGender.MALE)
+            if str(gender).casefold() in {"м", "муж", "мужской"}:
+                gender = DonorGender.MALE
+            elif str(gender).casefold() in {"ж", "жен", "женский"}:
+                gender = DonorGender.FEMALE
+            payload = DonorCreate(
+                full_name=full_name,
+                gender=gender,
+                academic_group=_row_value(row, "academic_group", "группа", "group", "шифр"),
+                blood_group=_row_value(row, "blood_group", "группа крови", "abo", "кровь"),
+                rh_factor=_row_value(row, "rh_factor", "резус", "rh"),
+                kell_status=_row_value(row, "kell_status", "kell", "келл"),
+            )
+        except (ValidationError, ValueError) as exc:
+            result["skipped"] += 1
+            result["items"].append({"row": index, "status": "skipped", "reason": str(exc)})
+            continue
+        key = _dedupe_key(payload.full_name, payload.academic_group)
+        donor = by_key.get(key)
+        if donor is None:
+            donor = Donor(**payload.model_dump())
+            db.add(donor)
+            db.flush()
+            by_key[key] = donor
+            result["created"] += 1
+            outcome = "created"
+        else:
+            changes = payload.model_dump(exclude_unset=True)
+            phenotype = {field: changes[field] for field in ("blood_group", "rh_factor", "kell_status") if changes.get(field) is not None}
+            if not phenotype:
+                result["skipped"] += 1
+                result["items"].append({"row": index, "status": "skipped", "reason": "Донор уже существует"})
+                continue
+            for field, value in phenotype.items():
+                setattr(donor, field, value)
+            result["updated"] += 1
+            outcome = "updated"
+        result["items"].append({"row": index, "status": outcome, "donor_id": str(donor.id)})
+        donation_date = _parse_import_date(_row_value(row, "donation_date", "дата донации", "дата сдачи", "дата кроводачи", "date"))
+        donation_type = _import_donation_type(_row_value(row, "donation_type", "тип донации", "вид донации", "тип", "вид"))
+        if donation_date is not None and donation_type is not None:
+            duplicate = db.scalar(select(Donation.id).where(Donation.donor_id == donor.id, Donation.donation_date == donation_date))
+            if duplicate:
+                result["donations_skipped"] += 1
+                result["items"][-1]["donation_status"] = "skipped_duplicate"
+            else:
+                donation = Donation(
+                    donor_id=donor.id,
+                    donation_date=donation_date,
+                    donation_type=donation_type,
+                    is_rewarded=_import_rewarded(_row_value(row, "is_rewarded", "rewarded", "поощрена", "поощрено", "благодарность")),
+                    medical_center=_row_value(row, "medical_center", "медицинский центр", "место", "опк", "центр"),
+                    certificate_number=_row_value(row, "certificate_number", "номер справки", "справка", "номер"),
+                )
+                db.add(donation)
+                db.flush()
+                result["donations_created"] += 1
+                result["items"][-1]["donation_status"] = "created"
+        elif any(_row_value(row, name) for name in ("donation_date", "дата донации", "дата сдачи", "дата кроводачи", "date")):
+            result["donations_skipped"] += 1
+            result["items"][-1]["donation_status"] = "skipped_invalid_date_or_type"
+    db.commit()
+    return result
+
+
 @router.get("", response_model=DonorPage)
-def list_donors(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), blood_group: str | None = None, rh_factor: str | None = None, kell_status: str | None = None, status: DonorStatus | None = None, available_on: date | None = None, donation_type: DonationType = DonationType.WHOLE_BLOOD, db: Session = Depends(get_db), _: str = Depends(get_current_user)) -> DonorPage:
+def list_donors(limit: int = Query(1000, ge=1, le=1000), offset: int = Query(0, ge=0), blood_group: str | None = None, rh_factor: str | None = None, kell_status: str | None = None, status: DonorStatus | None = None, available_on: date | None = None, donation_type: DonationType = DonationType.WHOLE_BLOOD, db: Session = Depends(get_db), _: str = Depends(get_current_user)) -> DonorPage:
     query = select(Donor).options(selectinload(Donor.donations))
-    count_query = select(func.count()).select_from(Donor)
     filters = []
     if blood_group:
         filters.append(Donor.blood_group == blood_group)
@@ -31,11 +254,12 @@ def list_donors(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=
         filters.append(Donor.status == status)
     if filters:
         query = query.where(*filters)
-        count_query = count_query.where(*filters)
-    donors = list(db.scalars(query.order_by(Donor.full_name).offset(offset).limit(limit)).unique())
+    donors = list(db.scalars(query.order_by(Donor.full_name)).unique())
     if available_on is not None:
         donors = [d for d in donors if d.status == DonorStatus.ACTIVE and calculate_next_eligible_date(d.donations, donation_type, d.gender, on_date=available_on) <= available_on]
-    return DonorPage(items=[DonorRead.model_validate(d) for d in donors], total=db.scalar(count_query) or 0, limit=limit, offset=offset)
+    total = len(donors)
+    donors = donors[offset:offset + limit]
+    return DonorPage(items=[DonorRead.model_validate(d) for d in donors], total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=DonorRead, status_code=201)

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import date, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Index, String, UniqueConstraint
@@ -90,6 +89,8 @@ class Donation(Base):
         Enum(DonationType, name="donation_type"), nullable=False
     )
     is_rewarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    medical_center: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    certificate_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, nullable=False
     )

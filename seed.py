@@ -6,27 +6,17 @@ The command is idempotent and never removes or overwrites existing records.
 
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from backend.database import Base, SessionLocal, engine
 from backend.models import Donation, DonationType, Donor, DonorGender
 
-SEED_DONORS = [
-    ("Александр Иванович Волков", DonorGender.MALE, "ХТ-11", "O(I)", "Rh-", "Kell-"),
-    ("Мария Сергеевна Смирнова", DonorGender.FEMALE, "БТ-12", "A(II)", "Rh+", "Kell-"),
-    ("Дмитрий Андреевич Кузнецов", DonorGender.MALE, "Э-13", "B(III)", "Rh+", "Kell+"),
-    ("Анна Павловна Попова", DonorGender.FEMALE, "ТМ-21", "AB(IV)", "Rh+", "Kell-"),
-    ("Михаил Олегович Соколов", DonorGender.MALE, "ХТ-22", "O(I)", "Rh+", "Kell-"),
-    ("Екатерина Ильинична Лебедева", DonorGender.FEMALE, "БТ-23", "A(II)", "Rh-", "Kell-"),
-    ("Илья Романович Козлов", DonorGender.MALE, "Э-31", "B(III)", "Rh-", "Kell+"),
-    ("София Максимовна Новикова", DonorGender.FEMALE, "ТМ-32", "O(I)", "Rh+", "Kell-"),
-    ("Артём Николаевич Морозов", DonorGender.MALE, "ХТ-33", "A(II)", "Rh+", "Kell-"),
-    ("Полина Викторовна Павлова", DonorGender.FEMALE, "БТ-34", "AB(IV)", "Rh-", "Kell-"),
-]
-
 
 def seed() -> None:
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE donations ADD COLUMN IF NOT EXISTS medical_center VARCHAR(255)"))
+        connection.execute(text("ALTER TABLE donations ADD COLUMN IF NOT EXISTS certificate_number VARCHAR(64)"))
     today = date.today()
     with SessionLocal.begin() as db:
         for index, (name, gender, group, blood, rh, kell) in enumerate(SEED_DONORS):

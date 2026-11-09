@@ -1,13 +1,14 @@
 import type { ApiError, DonorPage, DobroRequest, DobroResponse, IntervalCalendar, MemoRequest, OCRTask } from './types'
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 let token = localStorage.getItem('donorflow_token')
+const detailText = (value: unknown): string => { if (typeof value === 'string') return value; if (Array.isArray(value)) return value.map(detailText).filter(Boolean).join('; '); if (value && typeof value === 'object') { const item = value as Record<string, unknown>; if (typeof item.msg === 'string') return item.msg; if (typeof item.message === 'string') return item.message; return Object.entries(item).map(([key, nested]) => `${key}: ${detailText(nested)}`).join(', ') }; return '' }
 export function setToken(value: string | null) { token = value; value ? localStorage.setItem('donorflow_token', value) : localStorage.removeItem('donorflow_token') }
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
-  if (!response.ok) { let message = `Ошибка запроса (${response.status})`; try { const data = await response.json(); message = data.detail || data.message || message } catch { /* non-json error */ }; const error = new Error(message) as ApiError; error.status = response.status; throw error }
+  if (!response.ok) { let message = `Ошибка запроса (${response.status})`; try { const data = await response.json(); message = detailText(data.detail || data.message) || message } catch { /* non-json error */ }; const error = new Error(message) as ApiError; error.status = response.status; throw error }
   if (response.status === 204) return undefined as T
   const contentType = response.headers.get('content-type') || ''
   return contentType.includes('application/json') ? response.json() : response.blob() as T
