@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from pathlib import Path
 from difflib import SequenceMatcher
 import re
 from threading import Lock
@@ -9,6 +10,7 @@ from time import monotonic
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -25,6 +27,8 @@ _TASKS: dict[UUID, dict] = {}
 _TASK_LOCK = Lock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _ALLOWED_TYPES = {"image/jpeg", "image/png", "image/tiff", "application/pdf"}
+_UPLOAD_DIR = Path(__file__).resolve().parents[1] / "uploads"
+_EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/tiff": ".tiff", "application/pdf": ".pdf"}
 
 
 def _prune() -> None:
@@ -149,12 +153,14 @@ def parse_certificate_upload(background_tasks: BackgroundTasks, file: UploadFile
     if len(content) > _MAX_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
     task_id = uuid4()
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (_UPLOAD_DIR / f"{task_id}{_EXTENSIONS[file.content_type]}").write_bytes(content)
     with _TASK_LOCK:
         if len(_TASKS) >= 1000:
             raise HTTPException(status_code=503, detail="OCR task registry is full; retry later")
         _TASKS[task_id] = {"status": "queued", "result": None, "error": None, "created": monotonic()}
     _EXECUTOR.submit(_process, task_id, content)
-    return OCRTaskResponse(task_id=task_id, status="queued")
+    return OCRTaskResponse(task_id=task_id, status="queued", result={"file_url": f"/api/v1/ocr/tasks/{task_id}/file"})
 
 
 @router.get("/tasks/{task_id}", response_model=OCRTaskResponse)
@@ -165,3 +171,11 @@ def get_ocr_task(task_id: UUID, _: str = Depends(get_current_user)) -> OCRTaskRe
         if task is None:
             raise HTTPException(status_code=404, detail="OCR task not found or expired")
         return OCRTaskResponse(task_id=task_id, status=task["status"], result=task["result"], error=task["error"])
+
+@router.get("/tasks/{task_id}/file")
+def get_ocr_file(task_id: UUID, _: str = Depends(get_current_user)):
+    for extension, media_type in ((".jpg", "image/jpeg"), (".png", "image/png"), (".tiff", "image/tiff"), (".pdf", "application/pdf")):
+        path = _UPLOAD_DIR / f"{task_id}{extension}"
+        if path.is_file():
+            return FileResponse(path, media_type=media_type)
+    raise HTTPException(status_code=404, detail="Certificate file not found")

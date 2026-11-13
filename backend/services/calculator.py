@@ -31,8 +31,8 @@ ANNUAL_WHOLE_BLOOD_LIMITS: dict[DonorGender, int] = {
     DonorGender.FEMALE: 4,
 }
 
-# Award thresholds are expressed in qualifying equivalents; one component
-# donation counts as half of a whole-blood donation for mixed histories.
+# Award thresholds are expressed in qualifying equivalents; platelet donations
+# count as whole-blood donations, while plasma donations count as half.
 HONORARY_DONOR_THRESHOLDS: dict[str, int] = {
     "moscow": 20,
     "russia": 40,
@@ -131,9 +131,9 @@ def honorary_donor_progress(
         raise ValueError("award must be 'moscow' or 'russia'") from exc
 
     total = sum(
-        1.0
-        if donation.donation_type == DonationType.WHOLE_BLOOD
-        else COMPONENT_EQUIVALENT
+        COMPONENT_EQUIVALENT
+        if donation.donation_type == DonationType.PLASMA
+        else 1.0
         for donation in donations
     )
     percent = min(total / target * 100, 100.0)

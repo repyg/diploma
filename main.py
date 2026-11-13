@@ -2,10 +2,25 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
+from backend.database import Base, engine
 from backend.routers import ai, auth, donations, donors, documents, ocr
 
 app = FastAPI(title="ДонорРХТУ API", version="1.0.0", description="API учета доноров и донорских донаций РХТУ")
+
+
+@app.on_event("startup")
+def initialize_database() -> None:
+    Base.metadata.create_all(bind=engine)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as connection:
+            for statement in (
+                "ALTER TABLE donations ADD COLUMN IF NOT EXISTS medical_center VARCHAR(255)",
+                "ALTER TABLE donations ADD COLUMN IF NOT EXISTS certificate_number VARCHAR(128)",
+                "ALTER TABLE donations ADD COLUMN IF NOT EXISTS file_path VARCHAR(512)",
+            ):
+                connection.execute(text(statement))
 
 app.add_middleware(
     CORSMiddleware,

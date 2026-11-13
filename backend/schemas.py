@@ -53,6 +53,7 @@ class DonationRead(ORMModel):
     is_rewarded: bool
     medical_center: str | None = None
     certificate_number: str | None = None
+    file_url: str | None = None
     created_at: datetime
 
 
@@ -73,6 +74,39 @@ class DonorCreate(BaseModel):
     @classmethod
     def empty_strings_to_none(cls, value):
         return None if isinstance(value, str) and not value.strip() else value
+
+
+class ImportedDonationItem(BaseModel):
+    donation_date: date
+    donation_type: DonationType
+    is_rewarded: bool = False
+    medical_center: str | None = Field(default=None, max_length=255)
+    certificate_number: str | None = Field(default=None, max_length=128)
+
+    @field_validator("donation_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value):
+        return normalize_donation_type(value)
+
+
+class ImportedDonorItem(BaseModel):
+    full_name: str = Field(min_length=2, max_length=255)
+    gender: DonorGender = DonorGender.MALE
+    academic_group: str | None = Field(default=None, max_length=32)
+    blood_group: str | None = Field(default=None, max_length=8)
+    rh_factor: str | None = Field(default=None, max_length=4)
+    kell_status: str | None = Field(default=None, max_length=16)
+    donation_date: date | None = None
+    donation_type: DonationType | None = None
+    is_rewarded: bool = False
+    medical_center: str | None = Field(default=None, max_length=255)
+    certificate_number: str | None = Field(default=None, max_length=128)
+    donations: list[ImportedDonationItem] = Field(default_factory=list)
+
+    @field_validator("donation_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value):
+        return normalize_donation_type(value) if value is not None else None
 
 
 class DonorUpdate(BaseModel):
@@ -175,6 +209,8 @@ class CoursePromotionRequest(BaseModel):
 
 class DonationVerify(BaseModel):
     donor_id: UUID
+    task_id: UUID | None = None
+    file_url: str | None = None
     donation_date: date
     donation_type: DonationType
     medical_center: str | None = None
@@ -197,6 +233,7 @@ class DonationListRead(ORMModel):
     is_rewarded: bool
     medical_center: str | None = None
     certificate_number: str | None = None
+    file_url: str | None = None
     created_at: datetime
 
 

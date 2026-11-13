@@ -90,7 +90,8 @@ class Donation(Base):
     )
     is_rewarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     medical_center: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    certificate_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    certificate_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    file_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, nullable=False
     )
