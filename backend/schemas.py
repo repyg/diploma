@@ -275,12 +275,26 @@ class KPPResponse(BaseModel):
     entries: list[KPPEntry]
 
 
+class AISettingsRequest(BaseModel):
+    api_key: str = Field(min_length=1, max_length=512, description="Пользовательский API-ключ (OpenAI / OpenRouter / Groq / DeepSeek)")
+    base_url: str = Field(default="https://api.openai.com/v1", min_length=8, max_length=255)
+    model: str = Field(default="gpt-4o-mini", min_length=1, max_length=128)
+
+
+class AISettingsResponse(BaseModel):
+    configured: bool
+    masked_key: str | None = None
+    base_url: str
+    model: str
+
+
 class DobroRequest(BaseModel):
     event_name: str = Field(min_length=1, max_length=255)
     description: str | None = Field(default=None, min_length=300, max_length=3000)
     start_time: str = Field(default="08:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     end_time: str = Field(default="13:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     volunteer_roles: list[str] = Field(default_factory=list, max_length=20)
+    api_key: str | None = Field(default=None, max_length=512)
 
 
 class DobroResponse(BaseModel):

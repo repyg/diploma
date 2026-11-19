@@ -22,6 +22,7 @@ def initialize_database() -> None:
             ):
                 connection.execute(text(statement))
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -30,7 +31,7 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-LLM-Api-Key"],
 )
 
 for api_router in (auth.router, donors.router, donations.router, documents.router, ai.router, ocr.router):

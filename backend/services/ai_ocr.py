@@ -10,12 +10,22 @@ from collections.abc import Callable
 from copy import deepcopy
 from datetime import date, timedelta
 from io import BytesIO
+from threading import Lock
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from ..models import DonationType
 from .calculator import required_interval_days
 
 USE_MOCK = os.getenv("OCR_USE_MOCK", "false").strip().lower() in {"1", "true", "yes"}
+
+_AI_CONFIG_LOCK = Lock()
+_AI_CONFIG: dict[str, str] = {
+    "api_key": os.getenv("LLM_API_KEY", os.getenv("GEMINI_API_KEY", os.getenv("OPENAI_API_KEY", ""))).strip(),
+    "base_url": os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/"),
+    "model": os.getenv("LLM_MODEL", "gemini-2.5-flash").strip(),
+}
 
 MOCK_RESPONSE: dict[str, Any] = {
     "status": "success",
@@ -69,13 +79,266 @@ _STOP_FIO_WORDS = {
     "российской", "федерации", "минздрава", "министерство", "здравоохранения",
     "справка", "выдана", "донору", "донор", "центр", "крови", "имени",
     "дмитрия", "рогачева", "гаврилова", "отделение", "переливания", "медицинский",
-    "учреждение", "здравоохранения", "города", "москвы", "россии", "форма",
+    "учреждение", "города", "москвы", "россии", "форма", "освобожден", "работы",
 }
 
 _EASYOCR_READER = None
 
 LLMNormalizer = Callable[[str], str | dict[str, Any]]
 OCRReader = Callable[[bytes], str]
+
+
+def set_ai_config(
+    api_key: str,
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta",
+    model: str = "gemini-2.5-flash",
+) -> dict[str, Any]:
+    """Save user-provided AI API key and endpoint settings in memory."""
+    with _AI_CONFIG_LOCK:
+        _AI_CONFIG["api_key"] = api_key.strip()
+        _AI_CONFIG["base_url"] = base_url.strip().rstrip("/")
+        _AI_CONFIG["model"] = model.strip()
+    return get_ai_config_status()
+
+
+def clear_ai_config() -> dict[str, Any]:
+    """Remove runtime AI API key and fall back to local algorithms."""
+    with _AI_CONFIG_LOCK:
+        _AI_CONFIG["api_key"] = ""
+    return get_ai_config_status()
+
+
+def get_ai_config_status() -> dict[str, Any]:
+    """Return current AI configuration with masked API key."""
+    with _AI_CONFIG_LOCK:
+        key = _AI_CONFIG["api_key"]
+        masked = f"{key[:6]}...{key[-4:]}" if len(key) > 10 else ("***" if key else None)
+        return {
+            "configured": bool(key),
+            "masked_key": masked,
+            "base_url": _AI_CONFIG["base_url"],
+            "model": _AI_CONFIG["model"],
+        }
+
+
+def _call_gemini_native(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    api_key: str,
+    model: str,
+    json_mode: bool = False,
+    timeout: float = 18.0,
+) -> str:
+    """Call Google Gemini Native REST API (supports AQ. and AIza keys)."""
+    gemini_model = model if model.startswith("gemini-") else "gemini-2.5-flash"
+    generation_config: dict[str, Any] = {"temperature": 0.1}
+    if json_mode:
+        generation_config["responseMimeType"] = "application/json"
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": generation_config,
+    }
+    data = json.dumps(payload).encode("utf-8")
+
+    # Пробуем сначала стандартный шлюз AI Studio, затем шлюз Vertex AI Express
+    endpoints = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}",
+        f"https://aiplatform.googleapis.com/v1/publishers/google/models/{gemini_model}:generateContent?key={api_key}",
+    )
+    last_error: Exception | None = None
+    for url in endpoints:
+        req = urllib_request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return body["candidates"][0]["content"]["parts"][0]["text"]
+        except (urllib_error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            last_error = exc
+            continue
+
+    raise RuntimeError(f"Gemini API request failed: {last_error}")
+
+
+def call_openai_compatible_llm(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    api_key: str | None = None,
+    json_mode: bool = False,
+    timeout: float = 18.0,
+) -> str:
+    """Call Gemini Native API (for AQ./AIza keys) or OpenAI-compatible API."""
+    with _AI_CONFIG_LOCK:
+        effective_key = (api_key or _AI_CONFIG["api_key"]).strip()
+        base_url = _AI_CONFIG["base_url"]
+        model = _AI_CONFIG["model"]
+
+    if not effective_key:
+        raise RuntimeError("API key is not configured")
+
+    # Если передан ключ Google Gemini (AQ.... или AIza...), используем нативный протокол Gemini
+    if effective_key.startswith(("AQ.", "AIza")) or "googleapis.com" in base_url:
+        return _call_gemini_native(
+            system_prompt,
+            user_prompt,
+            api_key=effective_key,
+            model=model,
+            json_mode=json_mode,
+            timeout=timeout,
+        )
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    req = urllib_request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {effective_key}",
+            "HTTP-Referer": "https://donorflow.local",
+            "X-Title": "DonorFlow AIS",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            return body["choices"][0]["message"]["content"]
+    except (urllib_error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"LLM request failed: {exc}") from exc
+
+
+def build_llm_certificate_normalizer(api_key: str | None = None) -> LLMNormalizer | None:
+    """Create an LLM normalizer function if an API key is available."""
+    with _AI_CONFIG_LOCK:
+        effective_key = (api_key or _AI_CONFIG["api_key"]).strip()
+    if not effective_key:
+        return None
+
+    system_prompt = (
+        "Ты — интеллектуальный модуль разбора медицинских справок донора (форма 447/у и 402/у). "
+        "На вход подается обезличенный OCR-текст справки (с возможными опечатками). "
+        "Верни СТРОГО валидный JSON-объект со следующей структурой:\n"
+        "{\n"
+        '  "full_name": "Фамилия Имя Отчество донора СТРОГО В ИМЕНИТЕЛЬНОМ ПАДЕЖЕ (например, Князева Милана Игоревна) или null",\n'
+        '  "academic_group": "Учебная группа (например, Э-14) или null",\n'
+        '  "donation_date": "Дата донации в формате YYYY-MM-DD (не путай с датой рождения или датой приказа Минздрава!) или null",\n'
+        '  "donation_type_ru": "Одно из: Цельная кровь | Плазма | Тромбоциты | null",\n'
+        '  "medical_center_short": "Краткое название центра крови (например, НМИЦ Рогачёва) или null",\n'
+        '  "certificate_number": "Номер справки (цифры) или null"\n'
+        "}\n"
+        "Не выдумывай значения, которых нет в тексте."
+    )
+
+    def _normalizer(masked_text: str) -> dict[str, Any]:
+        base: dict[str, Any] | None = None
+        try:
+            base = normalize_certificate_text(masked_text)
+        except ValueError:
+            base = None
+
+        try:
+            raw_json = call_openai_compatible_llm(
+                system_prompt,
+                masked_text,
+                api_key=effective_key,
+                json_mode=True,
+            )
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_json.strip(), flags=re.I)
+            llm_fields = json.loads(cleaned)
+        except Exception:
+            if base is not None:
+                return base
+            raise
+
+        if base is None:
+            llm_date = llm_fields.get("donation_date")
+            if not llm_date:
+                raise ValueError("OCR text does not contain a donation date")
+            base = {
+                "status": "success",
+                "confidence_score": 0.92,
+                "is_duplicate": False,
+                "extracted_data": {
+                    "full_name": None,
+                    "academic_group": None,
+                    "donation_date": str(llm_date),
+                    "donation_type_ru": None,
+                    "medical_center_short": None,
+                    "certificate_number": _extract_certificate_number(masked_text),
+                    "donation_sequence_number": None,
+                },
+                "medical_intervals": {
+                    "next_whole_blood_allowed": None,
+                    "status_comment": "Вид донации не указан в справке; медицинский интервал требует проверки.",
+                },
+                "raw_text": masked_text,
+                "masked_text": masked_text,
+            }
+
+        extracted = base["extracted_data"]
+        for key in (
+            "full_name",
+            "academic_group",
+            "donation_date",
+            "donation_type_ru",
+            "medical_center_short",
+            "certificate_number",
+        ):
+            val = llm_fields.get(key)
+            if isinstance(val, str) and val.strip():
+                if key == "donation_type_ru":
+                    val = _normalize_donation_type(val) or extracted.get(key)
+                extracted[key] = val.strip()
+
+        if extracted.get("donation_date") and extracted.get("donation_type_ru") in {
+            "Цельная кровь",
+            "Плазма",
+            "Тромбоциты",
+        }:
+            try:
+                parsed_date = date.fromisoformat(extracted["donation_date"])
+                donation_type = {
+                    "Цельная кровь": DonationType.WHOLE_BLOOD,
+                    "Плазма": DonationType.PLASMA,
+                    "Тромбоциты": DonationType.PLATELETS,
+                }[extracted["donation_type_ru"]]
+                interval_days = required_interval_days(donation_type, DonationType.WHOLE_BLOOD)
+                next_date = parsed_date + timedelta(days=interval_days)
+                base["medical_intervals"] = {
+                    "next_whole_blood_allowed": next_date.isoformat(),
+                    "status_comment": (
+                        f"Донор доступен для записи с {next_date:%d.%m.%Y}. "
+                        f"Медотвод: {interval_days} дней."
+                    ),
+                }
+            except ValueError:
+                pass
+
+        base["confidence_score"] = max(base.get("confidence_score", 0.85), 0.95)
+        return base
+
+    return _normalizer
 
 
 def mask_personal_data(text: str) -> str:
@@ -92,6 +355,20 @@ def _get_easyocr_reader():
         import easyocr
         _EASYOCR_READER = easyocr.Reader(["ru", "en"], gpu=False)
     return _EASYOCR_READER
+
+
+def _preprocess_image_pil(image_bytes: bytes):
+    """Pure Pillow preprocessing: suppress blue stamps, upscale small scans, sharpen."""
+    from PIL import Image, ImageFilter, ImageOps
+
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    r_channel, _, _ = img.split()
+    width, height = r_channel.size
+    if max(width, height) < 1400:
+        r_channel = r_channel.resize((width * 2, height * 2), Image.Resampling.LANCZOS)
+    cleaned = ImageOps.autocontrast(r_channel, cutoff=1)
+    cleaned = cleaned.filter(ImageFilter.SHARPEN)
+    return cleaned
 
 
 def _pdf_text(pdf_bytes: bytes) -> str:
@@ -123,13 +400,10 @@ def extract_text(image_bytes: bytes) -> str:
 
     try:
         import numpy as np
-        from PIL import Image, ImageOps
 
-        img = Image.open(BytesIO(image_bytes)).convert("L")
-        img = ImageOps.autocontrast(img)
-        image = np.asarray(img.convert("RGB"))
+        gray_img = _preprocess_image_pil(image_bytes)
+        image = np.asarray(gray_img.convert("RGB"))
         reader = _get_easyocr_reader()
-        # paragraph=False сохраняет реальные строки документа
         lines = reader.readtext(image, detail=0, paragraph=False)
         return "\n".join(lines)
     except ImportError:
@@ -137,14 +411,13 @@ def extract_text(image_bytes: bytes) -> str:
 
     try:
         import pytesseract
-        from PIL import Image, ImageOps
     except ImportError as exc:
         raise RuntimeError(
             "Install easyocr or pytesseract and Pillow to enable OCR"
         ) from exc
 
-    img = ImageOps.autocontrast(Image.open(BytesIO(image_bytes)).convert("L"))
-    return pytesseract.image_to_string(img, lang="rus+eng")
+    gray_img = _preprocess_image_pil(image_bytes)
+    return pytesseract.image_to_string(gray_img, lang="rus+eng", config="--oem 3 --psm 6")
 
 
 def _value_after_label(text: str, labels: tuple[str, ...]) -> str | None:
@@ -153,11 +426,20 @@ def _value_after_label(text: str, labels: tuple[str, ...]) -> str | None:
     return match.group(1).strip(" .;,«»\"'") if match else None
 
 
+def _fix_ocr_digits(raw: str) -> str:
+    """Fix common OCR confusions (O/О -> 0, З -> 3) inside date-like tokens."""
+    return re.sub(
+        r"(?<=[\d./«\"'-])[ОоOoЗз]|(?<!\w)[ОоOo](?=\d[./-])",
+        lambda m: "3" if m.group(0) in "Зз" else "0",
+        raw,
+    )
+
+
 def _parse_single_date(raw: str) -> date | None:
-    # 1. Проверка текстовых дат вида: «07» октября 2026
+    cleaned = _fix_ocr_digits(raw)
     text_match = re.search(
         r"[«\"']?(\d{1,2})[»\"']?\s+([а-яёА-ЯЁ]{3,10})\s+(\d{4})",
-        raw,
+        cleaned,
         re.IGNORECASE,
     )
     if text_match:
@@ -171,8 +453,7 @@ def _parse_single_date(raw: str) -> date | None:
                 except ValueError:
                     pass
 
-    # 2. Проверка числовых дат: 07.10.2026 или 2026-10-07
-    num_match = re.search(_DATE_NUMERIC_RE, raw)
+    num_match = re.search(_DATE_NUMERIC_RE, cleaned)
     if num_match:
         parts = re.split(r"[./-]", num_match.group(1))
         try:
@@ -187,7 +468,6 @@ def _parse_single_date(raw: str) -> date | None:
 
 
 def _extract_donation_date(text: str) -> str | None:
-    # Сначала ищем по явным меткам
     labeled = _value_after_label(
         text,
         ("дата донации", "дата сдачи", "дата кроводачи", "сдал\\(а\\)", "сдала", "сдал", "дата"),
@@ -197,7 +477,6 @@ def _extract_donation_date(text: str) -> str | None:
         if parsed and parsed.year >= 2020:
             return parsed.isoformat()
 
-    # Ищем по строкам, отсекая даты рождения и приказов Минздрава
     candidates: list[date] = []
     for line in text.splitlines():
         lower = line.lower()
@@ -214,16 +493,18 @@ def _extract_donation_date(text: str) -> str | None:
     return None
 
 
+def _title_fio(raw_fio: str) -> str:
+    return " ".join(w[:1].upper() + w[1:].lower() for w in raw_fio.split())
+
+
 def _extract_full_name(text: str) -> str | None:
-    # Отрезаем нижний блок с подписью врача и блок "Выдана для предъявления"
     clean_text = re.split(r"(?i)лицо[,\s]+выдавшее\s+справку|врач\s*[:.]", text)[0]
     clean_text = re.sub(r"(?i)выдана\s+для\s+предъявления[^\n]*", "", clean_text)
 
-    # 1. Ищем строго слова с ЗАГЛАВНОЙ буквы [А-ЯЁ] после маркеров "Выдана донору" / "ФИО"
-    # Обрати внимание: (?i:...) применяется ТОЛЬКО к префиксу, а ФИО чувствительно к регистру!
+    word_pat = r"(?:[А-ЯЁ][а-яё]{1,25}|[А-ЯЁ]{2,25})"
     patterns = (
-        r"(?i:(?:справка\s+)?(?:вы)?дана\s+донору|донору|ф\.?\s*и\.?\s*о\.?|фамилия[,\s]+имя[,\s]+отчество)[^А-ЯЁ\n]{0,10}([А-ЯЁ][а-яё]{1,25}\s+[А-ЯЁ][а-яё]{1,25}(?:\s+[А-ЯЁ][а-яё]{1,25})?)",
-        r"(?i:(?:справка\s+)?(?:вы)?дана)\s+([А-ЯЁ][а-яё]{1,25}\s+[А-ЯЁ][а-яё]{1,25}(?:\s+[А-ЯЁ][а-яё]{1,25})?)",
+        rf"(?i:(?:справка\s+)?(?:вы)?дана\s+донору|донору|ф\.?\s*и\.?\s*о\.?|фамилия[,\s]+имя[,\s]+отчество)[^А-ЯЁ\n]{{0,12}}({word_pat}\s+{word_pat}(?:\s+{word_pat})?)",
+        rf"(?i:(?:справка\s+)?(?:вы)?дана)\s+({word_pat}\s+{word_pat}(?:\s+{word_pat})?)",
     )
     for pat in patterns:
         match = re.search(pat, clean_text)
@@ -233,14 +514,13 @@ def _extract_full_name(text: str) -> str | None:
             ).strip()
             words = candidate.split()
             if len(words) >= 2 and not any(w.lower() in _STOP_FIO_WORDS for w in words):
-                return candidate
+                return _title_fio(candidate)
 
-    # 2. Резервный поиск тройки слов (Фамилия Имя Отчество) по окончанию отчества
-    for match in re.finditer(r"\b([А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,})\b", clean_text):
+    for match in re.finditer(rf"\b({word_pat}\s+{word_pat}\s+{word_pat})\b", clean_text):
         words = match.group(1).split()
         if not any(w.lower() in _STOP_FIO_WORDS for w in words):
-            if re.search(r"(?:ович|евич|ич|овна|евна|ична|ьич)$", words[2].lower()):
-                return match.group(1)
+            if re.search(r"(?:ович|евич|ич|овна|евна|ична|ьич|овичу|евичу|ичу|овне|евне|ичне)$", words[2].lower()):
+                return _title_fio(match.group(1))
 
     return None
 
@@ -271,7 +551,6 @@ def _extract_certificate_number(text: str) -> str:
         if match:
             return match.group(1)
 
-    # Бланки часто печатают короткий штрихкод отдельно в верхней части.
     for line in text.splitlines()[:8]:
         match = re.search(r"(?<!\d)(\d{6})(?!\d)", line)
         if match:
@@ -385,6 +664,17 @@ def parse_certificate(
 
 
 __all__ = [
-    "LLMNormalizer", "MOCK_RESPONSE", "OCRReader", "USE_MOCK", "extract_text",
-    "mask_personal_data", "normalize_certificate_text", "parse_certificate",
+    "LLMNormalizer",
+    "MOCK_RESPONSE",
+    "OCRReader",
+    "USE_MOCK",
+    "build_llm_certificate_normalizer",
+    "call_openai_compatible_llm",
+    "clear_ai_config",
+    "extract_text",
+    "get_ai_config_status",
+    "mask_personal_data",
+    "normalize_certificate_text",
+    "parse_certificate",
+    "set_ai_config",
 ]

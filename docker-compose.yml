@@ -24,9 +24,12 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/donorflow
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-donorflow-development-secret-key-change-me-123456789}
-      COORDINATOR_USERNAME: ${COORDINATOR_USERNAME:-coordinato}
+      COORDINATOR_USERNAME: ${COORDINATOR_USERNAME:-coordinator}
       COORDINATOR_PASSWORD: ${COORDINATOR_PASSWORD:-coordinator123}
       OCR_USE_MOCK: ${OCR_USE_MOCK:-false}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
     depends_on:
       db:
         condition: service_healthy

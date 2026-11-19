@@ -1,11 +1,78 @@
-.venv
-__pycache__
-*.pyc
-.pytest_cache
-frontend/node_modules
-frontend/dist
-frontend/.env
+# ==========================================
+# 1. СЕКРЕТЫ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (API-ключи, пароли)
+# ==========================================
 .env
-.idea
-.claude
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# ==========================================
+# 2. ПОЛЬЗОВАТЕЛЬСКИЕ ЗАГРУЗКИ И АРТЕФАКТЫ OCR (ФЗ-152!)
+# ==========================================
+uploads/
+backend/uploads/
+*.EasyOCR/
+
+# ==========================================
+# 3. PYTHON / BACKEND
+# ==========================================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+
+# Тесты, покрытие и линтеры
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Локальные дампы БД (если делаешь бэкапы)
+*.sql
+*.dump
+*.sqlite3
+*.db
+
+# ==========================================
+# 4. FRONTEND (React / Vite / Node.js)
+# ==========================================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==========================================
+# 5. IDE, ИИ-АССИСТЕНТЫ И ОС
+# ==========================================
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# 6. ЛОКАЛЬНЫЕ ПРИМЕРЫ И ВРЕМЕННЫЕ ФАЙЛЫ
+# ==========================================
 /examples
+tmp/
+temp/
+*.log

@@ -2,22 +2,22 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
-from pathlib import Path
 from difflib import SequenceMatcher
+from pathlib import Path
 import re
 from threading import Lock
 from time import monotonic
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
-from ..database import SessionLocal, get_db
+from ..database import SessionLocal
 from ..models import Donation, Donor
 from ..schemas import OCRTaskResponse
-from ..services.ai_ocr import parse_certificate
+from ..services.ai_ocr import build_llm_certificate_normalizer, parse_certificate
 from .auth import get_current_user
 
 router = APIRouter(prefix="/ocr", tags=["ocr"])
@@ -43,10 +43,14 @@ def _normalize_name(value: str | None) -> str:
 
 
 def _stem_word(word: str) -> str:
-    """Убираем только падежные окончания у длинных слов (не трогая корни)."""
-    if len(word) <= 5:
+    """Убираем падежные окончания (включая дательный и родительный падежи в справках)."""
+    if len(word) <= 4:
         return word
-    return re.sub(r"(?:овой|евой|иной|скому|цкому|ому|ему|ой|ей|ом|ем|у|ю|е)$", "", word)
+    return re.sub(
+        r"(?:овичу|евичу|овне|евне|ичне|овой|евой|иной|скому|цкому|ому|ему|ович|евич|овна|евна|ична|ичу|ой|ей|ом|ем|ам|ям|ах|ях|ая|яя|ий|ый|ии|ие|у|ю|е|а|я)$",
+        "",
+        word,
+    )
 
 
 def _name_similarity(ocr_name: str, db_name: str) -> float:
@@ -55,22 +59,18 @@ def _name_similarity(ocr_name: str, db_name: str) -> float:
     if len(words_ocr) < 2 or len(words_db) < 2:
         return 0.0
 
-    # В русских справках порядок всегда «Фамилия Имя [Отчество]».
-    # Проверяем, чтобы фамилия и имя совпадали по отдельности, а не только отчество!
     stems_ocr = [_stem_word(w) for w in words_ocr]
     stems_db = [_stem_word(w) for w in words_db]
 
-    # Сравниваем первое слово (Фамилию) с первым или последним словом в БД
     surname_score = max(
         SequenceMatcher(None, stems_ocr[0], stems_db[0]).ratio(),
         SequenceMatcher(None, stems_ocr[0], stems_db[-1]).ratio(),
     )
-    if surname_score < 0.82:
-        # Если фамилия вообще не похожа — это точно другой человек!
+    if surname_score < 0.80:
         return 0.0
 
-    full_ocr = " ".join( sorted(stems_ocr) )
-    full_db = " ".join( sorted(stems_db) )
+    full_ocr = " ".join(sorted(stems_ocr))
+    full_db = " ".join(sorted(stems_db))
     return SequenceMatcher(None, full_ocr, full_db).ratio()
 
 
@@ -78,7 +78,9 @@ def _find_donor(db: Session, extracted: dict, raw_text: str = "") -> Donor | Non
     donor_id = extracted.get("student_id")
     if donor_id:
         try:
-            donor = db.get(Donor, UUID(str(donor_id)))
+            donor = db.scalar(
+                select(Donor).options(selectinload(Donor.donations)).where(Donor.id == UUID(str(donor_id)))
+            )
         except (ValueError, TypeError):
             donor = None
         if donor is not None:
@@ -88,21 +90,22 @@ def _find_donor(db: Session, extracted: dict, raw_text: str = "") -> Donor | Non
     if not name:
         return None
 
-    all_donors = list(db.scalars(select(Donor)).all())
+    all_donors = list(db.scalars(select(Donor).options(selectinload(Donor.donations))).unique().all())
     if not all_donors:
         return None
 
     scored = [(_name_similarity(name, d.full_name), d) for d in all_donors]
     scored.sort(key=lambda item: item[0], reverse=True)
-    if scored and scored[0][0] >= 0.85:
+    if scored and scored[0][0] >= 0.84:
         return scored[0][1]
 
     return None
 
 
-def _process(task_id: UUID, content: bytes) -> None:
+def _process(task_id: UUID, content: bytes, api_key: str | None = None) -> None:
     try:
-        result = parse_certificate(content)
+        llm_normalizer = build_llm_certificate_normalizer(api_key)
+        result = parse_certificate(content, llm_normalizer=llm_normalizer)
         raw_text = result.get("raw_text", "")
         extracted = result.get("extracted_data") or {}
         donation_date = extracted.get("donation_date")
@@ -111,7 +114,6 @@ def _process(task_id: UUID, content: bytes) -> None:
         with SessionLocal() as db:
             donor = _find_donor(db, extracted, raw_text)
             if donor is not None:
-                # Автоматическое обогащение данными из БД контингента
                 extracted["student_id"] = str(donor.id)
                 extracted["full_name"] = donor.full_name
                 if not extracted.get("academic_group"):
@@ -143,7 +145,12 @@ def _process(task_id: UUID, content: bytes) -> None:
 
 
 @router.post("/parse-certificate", response_model=OCRTaskResponse, status_code=202)
-def parse_certificate_upload(background_tasks: BackgroundTasks, file: UploadFile = File(...), _: str = Depends(get_current_user)) -> OCRTaskResponse:
+def parse_certificate_upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    x_llm_api_key: str | None = Header(default=None),
+    _: str = Depends(get_current_user),
+) -> OCRTaskResponse:
     _prune()
     if file.content_type not in _ALLOWED_TYPES:
         raise HTTPException(status_code=415, detail="Upload a JPEG, PNG, TIFF, or PDF file")
@@ -159,7 +166,7 @@ def parse_certificate_upload(background_tasks: BackgroundTasks, file: UploadFile
         if len(_TASKS) >= 1000:
             raise HTTPException(status_code=503, detail="OCR task registry is full; retry later")
         _TASKS[task_id] = {"status": "queued", "result": None, "error": None, "created": monotonic()}
-    _EXECUTOR.submit(_process, task_id, content)
+    _EXECUTOR.submit(_process, task_id, content, x_llm_api_key)
     return OCRTaskResponse(task_id=task_id, status="queued", result={"file_url": f"/api/v1/ocr/tasks/{task_id}/file"})
 
 
@@ -172,9 +179,15 @@ def get_ocr_task(task_id: UUID, _: str = Depends(get_current_user)) -> OCRTaskRe
             raise HTTPException(status_code=404, detail="OCR task not found or expired")
         return OCRTaskResponse(task_id=task_id, status=task["status"], result=task["result"], error=task["error"])
 
+
 @router.get("/tasks/{task_id}/file")
 def get_ocr_file(task_id: UUID, _: str = Depends(get_current_user)):
-    for extension, media_type in ((".jpg", "image/jpeg"), (".png", "image/png"), (".tiff", "image/tiff"), (".pdf", "application/pdf")):
+    for extension, media_type in (
+        (".jpg", "image/jpeg"),
+        (".png", "image/png"),
+        (".tiff", "image/tiff"),
+        (".pdf", "application/pdf"),
+    ):
         path = _UPLOAD_DIR / f"{task_id}{extension}"
         if path.is_file():
             return FileResponse(path, media_type=media_type)
