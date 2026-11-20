@@ -1,0 +1,1 @@
+"""Local CV + OCR + Russian NLP certificate parsing package."""

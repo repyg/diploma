@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from ..database import get_db
-from ..models import DonationType, Donor, DonorStatus
+from ..models import Donation, DonationType, Donor, DonorStatus
 from ..schemas import KPPEntry, KPPRequest, KPPResponse, MemoRequest
 from ..services.calculator import calculate_next_eligible_date, honorary_donor_progress
 from ..services.doc_generator import generate_memo
@@ -56,33 +56,48 @@ def memo(
 ) -> StreamingResponse:
     if payload.start_date > payload.end_date:
         raise HTTPException(status_code=422, detail="start_date must not be later than end_date")
-    donors = list(db.scalars(select(Donor).options(selectinload(Donor.donations)).order_by(Donor.full_name)).unique())
-    included = [
-        d
-        for d in donors
-        if any(payload.start_date <= x.donation_date <= payload.end_date and not x.is_rewarded for x in d.donations)
-    ]
+
+    donors = list(
+        db.scalars(
+            select(Donor)
+            .join(Donor.donations)
+            .options(selectinload(Donor.donations))
+            .where(
+                Donation.donation_date >= payload.start_date,
+                Donation.donation_date <= payload.end_date,
+                Donation.is_rewarded.is_(False),
+            )
+            .order_by(Donor.full_name)
+        ).unique()
+    )
     coordinators = (
         list(db.scalars(select(Donor).where(Donor.id.in_(payload.coordinator_ids))))
         if payload.coordinator_ids
         else []
     )
+    if not donors and not coordinators:
+        raise HTTPException(status_code=422, detail="За выбранный период нет непоощрённых донаций")
+
     try:
         buffer = generate_memo(
-            included,
+            donors,
             payload.start_date,
             payload.end_date,
             payload.event_name,
             recipient_name=payload.recipient_name,
+            salutation=payload.salutation,
             coordinators=coordinators,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    for donor in included:
-        for donation in donor.donations:
-            if payload.start_date <= donation.donation_date <= payload.end_date and not donation.is_rewarded:
-                donation.is_rewarded = True
-    db.commit()
+
+    if payload.mark_rewarded:
+        for donor in donors:
+            for donation in donor.donations:
+                if payload.start_date <= donation.donation_date <= payload.end_date and not donation.is_rewarded:
+                    donation.is_rewarded = True
+        db.commit()
+
     return StreamingResponse(
         buffer,
         media_type=DOCX_MEDIA_TYPE,

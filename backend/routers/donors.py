@@ -17,8 +17,18 @@ from sqlalchemy.orm import Session, selectinload
 from ..database import get_db
 from ..models import Donation, DonationType, Donor, DonorGender, DonorStatus
 from ..schemas import (CoursePromotionBatchResult, CoursePromotionRequest, CoursePromotionResult, DonorCreate, DonorPage, DonorRead, DonorUpdate, DonationIntervalResult, HonoraryDonorProgress, HonoraryDonorProgressResult, IntervalCalendar)
-from ..services.calculator import (annual_whole_blood_limit, calculate_next_eligible_date, count_whole_blood_donations, honorary_donor_progress, promote_donors_for_september, required_interval_days)
+from ..services.calculator import (
+    annual_whole_blood_limit,
+    calculate_next_eligible_date,
+    count_whole_blood_donations_rolling,
+    honorary_donor_progress,
+    promote_donors_for_september,
+    required_interval_days,
+)
 from .auth import get_current_user
+
+_MAX_IMPORT_BYTES = 10 * 1024 * 1024
+_MAX_XLSX_UNCOMPRESSED = 50 * 1024 * 1024
 
 router = APIRouter(prefix="/donors", tags=["donors"])
 
@@ -55,17 +65,24 @@ def _normalize_group(value: str | None) -> str | None:
 
 def _infer_gender(full_name: str) -> str | None:
     parts = full_name.strip().casefold().split()
-    patronymic = parts[1] if len(parts) > 1 else ""
     surname = parts[0] if parts else ""
-    if re.search(r"(ич|оглы|улы)$", patronymic) or re.search(r"(ов|ев|ин|ын|ский|цкий)$", surname):
+    patronymic = parts[2] if len(parts) >= 3 else ""
+    if re.search(r"(ич|оглы|улы)$", patronymic):
         return "male"
-    if re.search(r"(на|кызы)$", patronymic) or re.search(r"(ова|ева|ина|ына|ская|цкая)$", surname):
+    if re.search(r"(на|кызы)$", patronymic):
         return "female"
+    if re.search(r"(ова|ева|ина|ына|ская|цкая)$", surname):
+        return "female"
+    if re.search(r"(ов|ев|ин|ын|ский|цкий)$", surname):
+        return "male"
     return None
 
 
 def _xlsx_rows(content: bytes) -> list[list[str]]:
     with zipfile.ZipFile(BytesIO(content)) as archive:
+        total_size = sum(info.file_size for info in archive.infolist())
+        if total_size > _MAX_XLSX_UNCOMPRESSED:
+            raise ValueError("XLSX превышает допустимый размер после распаковки")
         shared: list[str] = []
         if "xl/sharedStrings.xml" in archive.namelist():
             root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
@@ -141,8 +158,11 @@ async def parse_import(request: Request, _: str = Depends(get_current_user)) -> 
     filename = str(upload.filename or "")
     if filename.lower().rsplit(".", 1)[-1] not in {"csv", "tsv", "xlsx"}:
         raise HTTPException(status_code=415, detail="Поддерживаются CSV, TSV и XLSX")
+    content = await upload.read(_MAX_IMPORT_BYTES + 1)
+    if len(content) > _MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="Размер файла импорта не должен превышать 10 МБ")
     try:
-        rows = _table_payload(filename, await upload.read())
+        rows = _table_payload(filename, content)
     except (UnicodeDecodeError, zipfile.BadZipFile, ET.ParseError, csv.Error, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Не удалось прочитать файл импорта") from exc
     headers = list(rows[0].keys()) if rows else []
@@ -218,7 +238,10 @@ async def bulk_import(request: Request, db: Session = Depends(get_db), _: str = 
             filename = str(upload.filename or "")
             if filename.lower().rsplit(".", 1)[-1] not in {"csv", "tsv", "xlsx"}:
                 raise HTTPException(status_code=415, detail="Поддерживаются CSV, TSV и XLSX")
-            rows = _table_payload(filename, await upload.read())
+            content = await upload.read(_MAX_IMPORT_BYTES + 1)
+            if len(content) > _MAX_IMPORT_BYTES:
+                raise HTTPException(status_code=413, detail="Размер файла импорта не должен превышать 10 МБ")
+            rows = _table_payload(filename, content)
             replace_all = str(form.get("replace_all", "false")).lower() in {"1", "true", "yes", "on"}
 
         if replace_all:
@@ -327,6 +350,19 @@ async def bulk_import(request: Request, db: Session = Depends(get_db), _: str = 
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+def _serialize_donor_with_eligibility(donor: Donor, as_of: date) -> DonorRead:
+    dto = DonorRead.model_validate(donor)
+    history = list(donor.donations)
+    eligible = calculate_next_eligible_date(history, DonationType.WHOLE_BLOOD, donor.gender, on_date=as_of)
+    wb_count = count_whole_blood_donations_rolling(history, as_of)
+    limit_reached = wb_count >= annual_whole_blood_limit(donor.gender)
+    dto.eligible_whole_blood_from = eligible
+    dto.annual_limit_reached = limit_reached
+    dto.is_eligible_whole_blood = (
+        donor.status == DonorStatus.ACTIVE and eligible <= as_of and not limit_reached
+    )
+    return dto
+
 
 @router.get("", response_model=DonorPage)
 def list_donors(limit: int = Query(1000, ge=1, le=1000), offset: int = Query(0, ge=0), blood_group: str | None = None, rh_factor: str | None = None, kell_status: str | None = None, status: DonorStatus | None = None, available_on: date | None = None, donation_type: DonationType = DonationType.WHOLE_BLOOD, db: Session = Depends(get_db), _: str = Depends(get_current_user)) -> DonorPage:
@@ -347,7 +383,7 @@ def list_donors(limit: int = Query(1000, ge=1, le=1000), offset: int = Query(0, 
         donors = [d for d in donors if d.status == DonorStatus.ACTIVE and calculate_next_eligible_date(d.donations, donation_type, d.gender, on_date=available_on) <= available_on]
     total = len(donors)
     donors = donors[offset:offset + limit]
-    return DonorPage(items=[DonorRead.model_validate(d) for d in donors], total=total, limit=limit, offset=offset)
+    return DonorPage(items=[_serialize_donor_with_eligibility(d, available_on or date.today()) for d in donors], total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=DonorRead, status_code=201)
@@ -399,7 +435,7 @@ def donor_intervals(donor_id: UUID, on_date: date | None = None, db: Session = D
     as_of = on_date or date.today()
     history = list(donor.donations)
     latest = max(history, key=lambda item: item.donation_date, default=None)
-    whole_count = count_whole_blood_donations(history, as_of.year)
+    whole_count = count_whole_blood_donations_rolling(history, as_of)
     intervals = []
     for next_type in DonationType:
         allowed = calculate_next_eligible_date(history, next_type, donor.gender, on_date=as_of)

@@ -49,11 +49,14 @@ def update_ai_settings(
     _: str = Depends(get_current_user),
 ) -> AISettingsResponse:
     """Установить пользовательский API-ключ и модель для OCR и генерации текстов."""
-    status = set_ai_config(
-        api_key=payload.api_key,
-        base_url=payload.base_url,
-        model=payload.model,
-    )
+    try:
+        status = set_ai_config(
+            api_key=payload.api_key,
+            base_url=payload.base_url,
+            model=payload.model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return AISettingsResponse(**status)
 
 

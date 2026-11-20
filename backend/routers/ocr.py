@@ -8,6 +8,8 @@ import re
 from threading import Lock
 from time import monotonic
 from uuid import UUID, uuid4
+from rapidfuzz import fuzz
+from sqlalchemy import func
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -19,6 +21,7 @@ from ..models import Donation, Donor
 from ..schemas import OCRTaskResponse
 from ..services.ai_ocr import build_llm_certificate_normalizer, parse_certificate
 from .auth import get_current_user
+from ..services.ocr.nlp_extractor import normalize_fio_nominative
 
 router = APIRouter(prefix="/ocr", tags=["ocr"])
 _MAX_BYTES = 10 * 1024 * 1024
@@ -29,6 +32,17 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _ALLOWED_TYPES = {"image/jpeg", "image/png", "image/tiff", "application/pdf"}
 _UPLOAD_DIR = Path(__file__).resolve().parents[1] / "uploads"
 _EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/tiff": ".tiff", "application/pdf": ".pdf"}
+
+def _matches_magic(content: bytes, content_type: str) -> bool:
+    if content_type == "image/jpeg":
+        return content.startswith(b"\xff\xd8\xff")
+    if content_type == "image/png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    if content_type == "image/tiff":
+        return content.startswith((b"II*\x00", b"MM\x00*"))
+    if content_type == "application/pdf":
+        return content.lstrip().startswith(b"%PDF-")
+    return False
 
 
 def _prune() -> None:
@@ -41,84 +55,78 @@ def _prune() -> None:
 def _normalize_name(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().casefold().replace("ё", "е"))
 
-
-def _stem_word(word: str) -> str:
-    """Убираем падежные окончания (включая дательный и родительный падежи в справках)."""
-    if len(word) <= 4:
-        return word
-    return re.sub(
-        r"(?:овичу|евичу|овне|евне|ичне|овой|евой|иной|скому|цкому|ому|ему|ович|евич|овна|евна|ична|ичу|ой|ей|ом|ем|ам|ям|ах|ях|ая|яя|ий|ый|ии|ие|у|ю|е|а|я)$",
-        "",
-        word,
-    )
-
-
-def _name_similarity(ocr_name: str, db_name: str) -> float:
-    words_ocr = _normalize_name(ocr_name).split()
-    words_db = _normalize_name(db_name).split()
-    if len(words_ocr) < 2 or len(words_db) < 2:
-        return 0.0
-
-    stems_ocr = [_stem_word(w) for w in words_ocr]
-    stems_db = [_stem_word(w) for w in words_db]
-
-    surname_score = max(
-        SequenceMatcher(None, stems_ocr[0], stems_db[0]).ratio(),
-        SequenceMatcher(None, stems_ocr[0], stems_db[-1]).ratio(),
-    )
-    if surname_score < 0.80:
-        return 0.0
-
-    full_ocr = " ".join(sorted(stems_ocr))
-    full_db = " ".join(sorted(stems_db))
-    return SequenceMatcher(None, full_ocr, full_db).ratio()
-
-
-def _find_donor(db: Session, extracted: dict, raw_text: str = "") -> Donor | None:
+def _match_donors_rapidfuzz(
+    db: Session,
+    extracted: dict,
+) -> tuple[tuple[UUID, str, str | None] | None, list[dict]]:
     donor_id = extracted.get("student_id")
     if donor_id:
         try:
-            donor = db.scalar(
-                select(Donor).options(selectinload(Donor.donations)).where(Donor.id == UUID(str(donor_id)))
-            )
+            row = db.execute(
+                select(Donor.id, Donor.full_name, Donor.academic_group).where(Donor.id == UUID(str(donor_id)))
+            ).first()
+            if row is not None:
+                return (row[0], row[1], row[2]), [{"id": str(row[0]), "full_name": row[1], "score": 100.0}]
         except (ValueError, TypeError):
-            donor = None
-        if donor is not None:
-            return donor
+            pass
 
-    name = extracted.get("full_name")
-    if not name:
-        return None
+    raw_name = extracted.get("full_name")
+    if not raw_name:
+        return None, []
 
-    all_donors = list(db.scalars(select(Donor).options(selectinload(Donor.donations))).unique().all())
-    if not all_donors:
-        return None
+    norm_query = _normalize_name(normalize_fio_nominative(str(raw_name)) or str(raw_name))
+    all_rows = db.execute(select(Donor.id, Donor.full_name, Donor.academic_group)).all()
+    if not all_rows:
+        return None, []
 
-    scored = [(_name_similarity(name, d.full_name), d) for d in all_donors]
+    scored: list[tuple[float, tuple[UUID, str, str | None]]] = []
+    for d_id, d_name, d_group in all_rows:
+        norm_db = _normalize_name(d_name)
+        score = float(
+            max(
+                fuzz.token_sort_ratio(norm_query, norm_db),
+                fuzz.token_set_ratio(norm_query, norm_db) - 3.0,
+            )
+        )
+        if score >= 75.0:
+            scored.append((round(score, 1), (d_id, d_name, d_group)))
+
     scored.sort(key=lambda item: item[0], reverse=True)
-    if scored and scored[0][0] >= 0.84:
-        return scored[0][1]
+    candidates = [
+        {"id": str(row[0]), "full_name": row[1], "academic_group": row[2], "score": score}
+        for score, row in scored[:3]
+    ]
 
-    return None
+    if not scored:
+        return None, []
+
+    top_score, top_row = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    # Автоподстановка только при высокой уверенности и отрыве от второго кандидата
+    if top_score >= 88.0 and (top_score - second_score >= 5.0 or top_score >= 97.0):
+        return top_row, candidates
+    return None, candidates
 
 
 def _process(task_id: UUID, content: bytes, api_key: str | None = None) -> None:
     try:
-        llm_normalizer = build_llm_certificate_normalizer(api_key)
-        result = parse_certificate(content, llm_normalizer=llm_normalizer)
-        raw_text = result.get("raw_text", "")
+        result = parse_certificate(content)
         extracted = result.get("extracted_data") or {}
         donation_date = extracted.get("donation_date")
         duplicate = False
 
         with SessionLocal() as db:
-            donor = _find_donor(db, extracted, raw_text)
-            if donor is not None:
-                extracted["student_id"] = str(donor.id)
-                extracted["full_name"] = donor.full_name
+            matched, candidates = _match_donors_rapidfuzz(db, extracted)
+            result["matched_candidates"] = candidates
+            if matched is not None:
+                d_id, d_name, d_group = matched
+                extracted["student_id"] = str(d_id)
+                extracted["full_name"] = d_name
                 if not extracted.get("academic_group"):
-                    extracted["academic_group"] = donor.academic_group
-                extracted["donation_sequence_number"] = len(donor.donations) + 1
+                    extracted["academic_group"] = d_group
+
+                don_count = db.scalar(select(func.count(Donation.id)).where(Donation.donor_id == d_id)) or 0
+                extracted["donation_sequence_number"] = int(don_count) + 1
 
                 if donation_date:
                     try:
@@ -126,12 +134,15 @@ def _process(task_id: UUID, content: bytes, api_key: str | None = None) -> None:
                     except (ValueError, TypeError):
                         parsed_date = None
                     if parsed_date is not None:
-                        duplicate = db.scalar(
-                            select(Donation.id).where(
-                                Donation.donor_id == donor.id,
-                                Donation.donation_date == parsed_date,
+                        duplicate = (
+                            db.scalar(
+                                select(Donation.id).where(
+                                    Donation.donor_id == d_id,
+                                    Donation.donation_date == parsed_date,
+                                )
                             )
-                        ) is not None
+                            is not None
+                        )
 
         result["extracted_data"] = extracted
         result["is_duplicate"] = duplicate
@@ -142,7 +153,6 @@ def _process(task_id: UUID, content: bytes, api_key: str | None = None) -> None:
         with _TASK_LOCK:
             if task_id in _TASKS:
                 _TASKS[task_id].update(status="failed", error=str(exc), result=None)
-
 
 @router.post("/parse-certificate", response_model=OCRTaskResponse, status_code=202)
 def parse_certificate_upload(
@@ -159,6 +169,8 @@ def parse_certificate_upload(
         raise HTTPException(status_code=422, detail="Uploaded file is empty")
     if len(content) > _MAX_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
+    if not _matches_magic(content, file.content_type):
+        raise HTTPException(status_code=415, detail="Содержимое файла не соответствует заявленному типу")
     task_id = uuid4()
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     (_UPLOAD_DIR / f"{task_id}{_EXTENSIONS[file.content_type]}").write_bytes(content)

@@ -28,7 +28,7 @@ def generate_memo(
     event_name: str,
     *,
     recipient_name: str = "Лина Александровна",
-    coordinators: Iterable[Donor] = (),
+    coordinators: Iterable[Donor] = (),salutation: str = "Уважаемая",
 ) -> BytesIO:
     """Build a memo for un-rewarded donations in the requested date range.
 
@@ -63,7 +63,7 @@ def generate_memo(
 
     recipient = document.add_paragraph()
     recipient.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    recipient.add_run(f"Уважаемая {recipient_name}!")
+    recipient.add_run(f"{salutation} {recipient_name}!")
 
     document.add_paragraph(
         f"Просим Вас объявить благодарность за помощь в проведении мероприятия «{event_name}» "

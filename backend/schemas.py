@@ -135,6 +135,9 @@ class DonorRead(ORMModel):
     status: DonorStatus
     created_at: datetime
     donations: list[DonationRead] = Field(default_factory=list)
+    eligible_whole_blood_from: date | None = None
+    is_eligible_whole_blood: bool | None = None
+    annual_limit_reached: bool | None = None
 
 
 class DonationIntervalResult(BaseModel):
@@ -249,7 +252,9 @@ class MemoRequest(BaseModel):
     end_date: date
     event_name: str = Field(min_length=1, max_length=500)
     recipient_name: str = Field(default="Лина Александровна", min_length=1, max_length=255)
+    salutation: str = Field(default="Уважаемая", min_length=1, max_length=64)
     coordinator_ids: list[UUID] = Field(default_factory=list)
+    mark_rewarded: bool = True
 
 
 class KPPRequest(BaseModel):

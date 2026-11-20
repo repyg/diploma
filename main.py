@@ -1,5 +1,6 @@
 """FastAPI application entry point for DonorFlow."""
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -7,11 +8,9 @@ from sqlalchemy import text
 from backend.database import Base, engine
 from backend.routers import ai, auth, donations, donors, documents, ocr
 
-app = FastAPI(title="ДонорРХТУ API", version="1.0.0", description="API учета доноров и донорских донаций РХТУ")
 
-
-@app.on_event("startup")
-def initialize_database() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     if engine.dialect.name == "postgresql":
         with engine.begin() as connection:
@@ -21,7 +20,15 @@ def initialize_database() -> None:
                 "ALTER TABLE donations ADD COLUMN IF NOT EXISTS file_path VARCHAR(512)",
             ):
                 connection.execute(text(statement))
+    yield
 
+
+app = FastAPI(
+    title="ДонорРХТУ API",
+    version="1.0.0",
+    description="API учета доноров и донорских донаций РХТУ",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,

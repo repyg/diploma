@@ -15,6 +15,8 @@ from ..models import Donation, Donor
 from ..schemas import DonationListRead, DonationRead, DonationVerify
 from .auth import get_current_user
 
+_UPLOAD_DIR = Path(__file__).resolve().parents[1] / "uploads"
+
 router = APIRouter(prefix="/donations", tags=["donations"])
 
 
@@ -73,11 +75,14 @@ def verify_donation(donation_id: UUID, payload: DonationVerify, db: Session = De
         if hasattr(donation, "certificate_number"):
             donation.certificate_number = payload.certificate_number
     if payload.task_id:
-        upload_dir = Path(__file__).resolve().parents[1] / "uploads"
-        file_path = next((upload_dir / f"{payload.task_id}{ext}" for ext in (".jpg", ".png", ".tiff", ".pdf") if (upload_dir / f"{payload.task_id}{ext}").is_file()), None)
+        file_path = next(
+            (_UPLOAD_DIR / f"{payload.task_id}{ext}" for ext in (".jpg", ".png", ".tiff", ".pdf")
+             if (_UPLOAD_DIR / f"{payload.task_id}{ext}").is_file()),
+            None,
+        )
         if file_path is None:
             raise HTTPException(status_code=404, detail="Certificate file not found")
-        donation.file_path = str(file_path)
+        donation.file_path = file_path.name
     try:
         db.commit()
     except IntegrityError:
@@ -92,8 +97,13 @@ def get_donation_file(donation_id: UUID, db: Session = Depends(get_db), _: str =
     donation = db.get(Donation, donation_id)
     if donation is None or not donation.file_path:
         raise HTTPException(status_code=404, detail="Certificate file not found")
-    path = Path(donation.file_path)
-    media_type = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".pdf": "application/pdf", ".tiff": "image/tiff"}.get(path.suffix.lower(), "application/octet-stream")
+    path = (_UPLOAD_DIR / Path(donation.file_path).name).resolve()
+    if not path.is_relative_to(_UPLOAD_DIR.resolve()) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Certificate file not found on disk")
+    media_type = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".pdf": "application/pdf", ".tiff": "image/tiff",
+    }.get(path.suffix.lower(), "application/octet-stream")
     return FileResponse(path, media_type=media_type)
 
 
@@ -102,5 +112,10 @@ def delete_donation(donation_id: UUID, db: Session = Depends(get_db), _: str = D
     donation = db.get(Donation, donation_id)
     if donation is None:
         raise HTTPException(status_code=404, detail="Donation not found")
+    stored_name = Path(donation.file_path).name if donation.file_path else None
     db.delete(donation)
     db.commit()
+    if stored_name:
+        candidate = (_UPLOAD_DIR / stored_name).resolve()
+        if candidate.is_relative_to(_UPLOAD_DIR.resolve()) and candidate.is_file():
+            candidate.unlink(missing_ok=True)

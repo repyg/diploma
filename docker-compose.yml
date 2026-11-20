@@ -28,8 +28,10 @@ services:
       COORDINATOR_PASSWORD: ${COORDINATOR_PASSWORD:-coordinator123}
       OCR_USE_MOCK: ${OCR_USE_MOCK:-false}
       LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
+      LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
+    volumes:
+      - uploads_data:/app/backend/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -50,3 +52,5 @@ services:
 volumes:
   postgres_data_clean:
     name: diploma_donor_postgres_data_clean
+  uploads_data:
+    name: diploma_donor_uploads_data

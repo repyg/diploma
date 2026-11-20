@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from uuid import UUID, uuid4
 
@@ -12,6 +12,10 @@ from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class DonorGender(StrEnum):
@@ -59,7 +63,7 @@ class Donor(Base):
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+        DateTime(timezone=True), default=_utc_now, nullable=False
     )
 
     donations: Mapped[list[Donation]] = relationship(
@@ -93,10 +97,14 @@ class Donation(Base):
     certificate_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+        DateTime(timezone=True), default=_utc_now, nullable=False
     )
 
     donor: Mapped[Donor] = relationship(back_populates="donations")
+
+    @property
+    def file_url(self) -> str | None:
+        return f"/api/v1/donations/{self.id}/file" if self.file_path else None
 
 
 __all__: Sequence[str] = (
